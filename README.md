@@ -1,2 +1,2 @@
 # proteinspectranet
-Signal processing, spectrogram generation, and attention-enhanced deep spectral learning for antiviral peptide classification using the ENNAVIA datasets.
+Code and experiments for protein-to-spectrogram transformation, spectral representation learning, and antiviral peptide classification.
