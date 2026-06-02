@@ -1,0 +1,110 @@
+import os
+import numpy as np
+from glob import glob
+import cv2
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, applications, regularizers
+
+
+
+data_dir_train_antiviral = "/kaggle/input/ennavia-a-spectrogram-images-by-r-and-d-2025/spectrogram images/antiviral training images"
+data_dir_test_antiviral = "/kaggle/input/ennavia-a-spectrogram-images-by-r-and-d-2025/spectrogram images/antiviral testing images"
+,
+data_dir_train_non_antiviral = "/kaggle/input/ennavia-a-spectrogram-images-by-r-and-d-2025/spectrogram images/exp-non-antiviral training images"
+data_dir_test_non_antiviral = "/kaggle/input/ennavia-a-spectrogram-images-by-r-and-d-2025/spectrogram images/exp-non-antiviral testing images"
+
+
+IMG_HEIGHT, IMG_WIDTH = 299, 299  
+
+
+
+def load_images_from_directory(directory, label):
+    images, labels = [], []
+    files = glob(os.path.join(directory, "*.png"))  
+    for file in files:
+        img = cv2.imread(file)
+        if img is None:
+            continue
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))  
+        img = img / 255.0  
+        images.append(img)
+        labels.append(label)  
+    return np.array(images), np.array(labels)
+
+X_train_antiviral, y_train_antiviral = load_images_from_directory(data_dir_train_antiviral, label=1)
+X_test_antiviral, y_test_antiviral = load_images_from_directory(data_dir_test_antiviral, label=1)
+
+X_train_non_antiviral, y_train_non_antiviral = load_images_from_directory(data_dir_train_non_antiviral, label=0)
+X_test_non_antiviral, y_test_non_antiviral = load_images_from_directory(data_dir_test_non_antiviral, label=0)
+
+# Combine both classes
+X_train = np.concatenate((X_train_antiviral, X_train_non_antiviral), axis=0)
+y_train = np.concatenate((y_train_antiviral, y_train_non_antiviral), axis=0)
+
+X_test = np.concatenate((X_test_antiviral, X_test_non_antiviral), axis=0)
+y_test = np.concatenate((y_test_antiviral, y_test_non_antiviral), axis=0)
+
+
+indices = np.arange(X_train.shape[0])
+np.random.shuffle(indices)
+X_train, y_train = X_train[indices], y_train[indices]
+
+indices_test = np.arange(X_test.shape[0])
+np.random.shuffle(indices_test)
+X_test, y_test = X_test[indices_test], y_test[indices_test]
+
+# InceptionV3 Model
+
+def build_inception_model(input_shape):
+    base_model = applications.InceptionV3(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    # Freeze initial layers, fine-tune last layers
+    for layer in base_model.layers[:280]:  
+        layer.trainable = False
+
+    inputs = layers.Input(shape=input_shape)
+    x = base_model(inputs, training=False)
+
+    # Global Pooling & Dense Layers
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.5)(x)
+    outputs = layers.Dense(1, activation='sigmoid')(x)  
+
+    model = models.Model(inputs, outputs)
+
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=0.0001, decay_steps=5000, decay_rate=0.9, staircase=True
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    
+    model.compile(optimizer=optimizer, 
+                  loss='binary_crossentropy', 
+                  metrics=['accuracy'])
+    return model
+
+
+model = build_inception_model((IMG_HEIGHT, IMG_WIDTH, 3))
+
+
+early_stopping = callbacks.EarlyStopping(monitor='val_loss', patience=25, restore_best_weights=True)
+model_checkpoint = callbacks.ModelCheckpoint("best_inception_model.keras", monitor='val_accuracy', save_best_only=True)
+
+
+history = model.fit(
+    X_train, y_train, batch_size=32, epochs=200,
+    validation_data=(X_test, y_test),
+    callbacks=[early_stopping, model_checkpoint],
+    verbose=1
+)
+
+
+model.load_weights("best_inception_model.keras")
+test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test accuracy: {test_accuracy * 100:.2f}%")
+
+
+tf.keras.models.save_model(model, "/kaggle/working/final_InceptionV3_model.keras")
+print("Model saved successfully in /kaggle/working/")
+

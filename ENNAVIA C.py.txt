@@ -1,0 +1,138 @@
+import os
+import numpy as np
+from glob import glob
+import cv2
+import tensorflow as tf
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import layers, models, callbacks, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet import preprocess_input
+from tensorflow.keras.layers import (
+    GlobalAveragePooling2D, GlobalMaxPooling2D, Dense, Reshape, Multiply,
+    Conv2D, Add, Activation, Lambda, Dropout
+)
+from tensorflow.keras import backend as K
+from sklearn.model_selection import train_test_split
+
+
+data_dir_anti_coronavirus = "/kaggle/input/ennavia-c-molec-mass-based-spectrogram-images-2025/spectrogram images/anti-coronavirus images"
+data_dir_exp_non_antiviral = "/kaggle/input/ennavia-c-molec-mass-based-spectrogram-images-2025/spectrogram images/exp-non-antiviral images"
+
+
+
+IMG_HEIGHT, IMG_WIDTH = 224, 224
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+
+
+def load_images_from_directory(directory, label):
+    images, labels = [], []
+    files = glob(os.path.join(directory, "*.png"))
+    for file in files:
+        img = cv2.imread(file)
+        if img is None:
+            continue
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
+        img = preprocess_input(img)
+        images.append(img)
+        labels.append(label)
+    return np.array(images), np.array(labels)
+
+
+X_anti_corona, y_anti_corona = load_images_from_directory(data_dir_anti_coronavirus, label=1)
+X_non_antiviral, y_non_antiviral = load_images_from_directory(data_dir_exp_non_antiviral, label=0)
+
+
+X = np.concatenate((X_anti_corona, X_non_antiviral), axis=0)
+y = np.concatenate((y_anti_corona, y_non_antiviral), axis=0)
+
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+)
+
+
+indices = np.arange(X_train.shape[0])
+np.random.shuffle(indices)
+X_train, y_train = X_train[indices], y_train[indices]
+
+
+datagen = ImageDataGenerator(
+    horizontal_flip=True,
+    vertical_flip=True,
+    brightness_range=[0.8, 1.2],
+)
+
+
+def cbam_block(input_tensor, ratio=8):
+    channel_avg = GlobalAveragePooling2D()(input_tensor)
+    channel_max = GlobalMaxPooling2D()(input_tensor)
+
+    channel_avg = Dense(input_tensor.shape[-1] // ratio, activation='relu')(channel_avg)
+    channel_avg = Dense(input_tensor.shape[-1])(channel_avg)
+
+    channel_max = Dense(input_tensor.shape[-1] // ratio, activation='relu')(channel_max)
+    channel_max = Dense(input_tensor.shape[-1])(channel_max)
+
+    channel_att = Add()([channel_avg, channel_max])
+    channel_att = Activation('sigmoid')(channel_att)
+    channel_att = Reshape((1, 1, input_tensor.shape[-1]))(channel_att)
+    channel_refined = Multiply()([input_tensor, channel_att])
+
+    avg_pool = Lambda(lambda x: tf.reduce_mean(x, axis=-1, keepdims=True))(channel_refined)
+    max_pool = Lambda(lambda x: tf.reduce_max(x, axis=-1, keepdims=True))(channel_refined)
+    concat = Add()([avg_pool, max_pool])
+    spatial_att = Conv2D(1, kernel_size=7, padding='same', activation='sigmoid')(concat)
+    spatial_refined = Multiply()([channel_refined, spatial_att])
+
+    return spatial_refined
+
+def build_resnet_cbam_model(input_shape):
+    base_model = ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    for layer in base_model.layers[:143]:
+        layer.trainable = False
+    for layer in base_model.layers[143:]:
+        layer.trainable = True
+
+    x = cbam_block(base_model.output)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.01))(x)
+    x = Dropout(0.5)(x)
+    outputs = Dense(1, activation='sigmoid')(x)
+
+    model = models.Model(inputs=base_model.input, outputs=outputs)
+
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=0.0001,
+        decay_steps=10000,
+        decay_rate=0.9,
+        staircase=True
+    )
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+
+model = build_resnet_cbam_model((IMG_HEIGHT, IMG_WIDTH, 3))
+
+early_stopping = callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+model_checkpoint = callbacks.ModelCheckpoint("best_resnet_cbam_model.keras", monitor='val_accuracy', save_best_only=True)
+
+history = model.fit(
+    datagen.flow(X_train, y_train, batch_size=32),
+    epochs=200,
+    validation_data=(X_test, y_test),
+    callbacks=[early_stopping, model_checkpoint],
+    verbose=1
+)
+
+
+model.load_weights("best_resnet_cbam_model.keras")
+test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test accuracy with CBAM: {test_accuracy * 100:.2f}%")
+
+tf.keras.models.save_model(model, "/kaggle/working/final_resnet50+CBAM_model.keras")
+print("Model saved successfully in /kaggle/working/")

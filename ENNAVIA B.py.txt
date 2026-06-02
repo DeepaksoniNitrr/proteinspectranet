@@ -1,0 +1,184 @@
+import os
+import numpy as np
+from glob import glob
+import cv2
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+# EfficientNetV2 imports
+from tensorflow.keras.applications.efficientnet_v2 import EfficientNetV2S, preprocess_input
+
+
+data_dir_train_antiviral = "/kaggle/input/ennavia-b-pi-based-spectrogram-images-2025/spectrogram images/antiviral training images"
+data_dir_test_antiviral = "/kaggle/input/ennavia-b-pi-based-spectrogram-images-2025/spectrogram images/antiviral testing images"
+
+data_dir_train_non_antiviral = "/kaggle/input/ennavia-b-pi-based-spectrogram-images-2025/spectrogram images/random-seq-non-antiviral training images"
+data_dir_test_non_antiviral = "/kaggle/input/ennavia-b-pi-based-spectrogram-images-2025/spectrogram images/random-seq-non-antiviral testing images"
+
+
+IMG_HEIGHT, IMG_WIDTH = 299, 299  # keep as your original
+
+
+def load_images_from_directory(directory, label):
+    images, labels = [], []
+    files = glob(os.path.join(directory, "*.png"))
+    for file in files:
+        img = cv2.imread(file)
+        if img is None:
+            continue
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
+        img = preprocess_input(img.astype(np.float32))
+        images.append(img)
+        labels.append(label)
+    return np.array(images), np.array(labels, dtype=np.float32)
+
+X_train_antiviral, y_train_antiviral = load_images_from_directory(data_dir_train_antiviral, label=1.0)
+X_test_antiviral, y_test_antiviral = load_images_from_directory(data_dir_test_antiviral, label=1.0)
+
+X_train_non_antiviral, y_train_non_antiviral = load_images_from_directory(data_dir_train_non_antiviral, label=0.0)
+X_test_non_antiviral, y_test_non_antiviral = load_images_from_directory(data_dir_test_non_antiviral, label=0.0)
+
+
+X_train = np.concatenate((X_train_antiviral, X_train_non_antiviral), axis=0)
+y_train = np.concatenate((y_train_antiviral, y_train_non_antiviral), axis=0)
+
+X_test = np.concatenate((X_test_antiviral, X_test_non_antiviral), axis=0)
+y_test = np.concatenate((y_test_antiviral, y_test_non_antiviral), axis=0)
+
+
+rng = np.random.default_rng(seed=1234)
+perm = rng.permutation(X_train.shape[0])
+X_train, y_train = X_train[perm], y_train[perm]
+perm_t = rng.permutation(X_test.shape[0])
+X_test, y_test = X_test[perm_t], y_test[perm_t]
+
+
+datagen = ImageDataGenerator(
+    horizontal_flip=True,
+    vertical_flip=True,
+    brightness_range=[0.85, 1.15],
+    # no strong rotations/shifts to preserve spectrogram structure
+)
+
+
+def sample_beta_distribution(alpha, size=1):
+    return np.random.beta(alpha, alpha, size)
+
+def get_cutmix_box(img_h, img_w, lam):
+    """Compute CutMix bounding box coords given lambda and image size."""
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(img_w * cut_rat)   # <- changed np.int -> int
+    cut_h = int(img_h * cut_rat)   # <- changed np.int -> int
+
+    # uniform center
+    cx = np.random.randint(img_w)
+    cy = np.random.randint(img_h)
+
+    x1 = np.clip(cx - cut_w // 2, 0, img_w)
+    y1 = np.clip(cy - cut_h // 2, 0, img_h)
+    x2 = np.clip(cx + cut_w // 2, 0, img_w)
+    y2 = np.clip(cy + cut_h // 2, 0, img_h)
+
+    return x1, y1, x2, y2
+
+
+def cutmix_batch(images, labels, alpha=1.0):
+    """Apply CutMix to a batch. images: (B,H,W,C), labels: (B,) scalar labels."""
+    batch_size = images.shape[0]
+    indices = np.arange(batch_size)
+    shuffled_indices = np.random.permutation(batch_size)
+
+    lam = sample_beta_distribution(alpha, size=batch_size)
+    new_images = images.copy()
+    new_labels = labels.copy().astype(np.float32)
+
+    for i in range(batch_size):
+        j = shuffled_indices[i]
+        lam_i = lam[i]
+        x1, y1, x2, y2 = get_cutmix_box(images.shape[1], images.shape[2], lam_i)
+        # If box is degenerate, skip
+        if x1 >= x2 or y1 >= y2:
+            new_images[i] = images[i]
+            new_labels[i] = labels[i]
+            continue
+
+        # paste patch from image j into image i
+        new_images[i, y1:y2, x1:x2, :] = images[j, y1:y2, x1:x2, :]
+        # adjust lambda to actual area ratio
+        box_area = (x2 - x1) * (y2 - y1)
+        lam_adjusted = 1.0 - (box_area / (images.shape[1] * images.shape[2]))
+        new_labels[i] = lam_adjusted * labels[i] + (1.0 - lam_adjusted) * labels[j]
+
+    return new_images, new_labels
+
+
+def cutmix_generator(X, y, datagen, batch_size=16, shuffle=True, cutmix_prob=0.5, alpha=1.0):
+    base_gen = datagen.flow(X, y, batch_size=batch_size, shuffle=shuffle)
+    while True:
+        images_batch, labels_batch = next(base_gen)  # labels are shape (B,)
+        if np.random.rand() < cutmix_prob:
+            images_batch, labels_batch = cutmix_batch(images_batch, labels_batch, alpha=alpha)
+        yield images_batch, labels_batch
+
+
+def build_efficientv2s_model(input_shape):
+    # include_top=False to add custom head
+    base_model = EfficientNetV2S(weights='imagenet', include_top=False, input_shape=input_shape)
+
+    # Freeze most layers; fine-tune last ~70 layers (conservative)
+    num_layers = len(base_model.layers)
+    freeze_until = max(0, num_layers - 70)  # fine-tune last 70 layers
+    for layer in base_model.layers[:freeze_until]:
+        layer.trainable = False
+    for layer in base_model.layers[freeze_until:]:
+        layer.trainable = True
+
+    x = base_model.output
+    x = layers.GlobalAveragePooling2D()(x)
+    x = layers.Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.4)(x)
+    outputs = layers.Dense(1, activation='sigmoid')(x)
+
+    model = models.Model(inputs=base_model.input, outputs=outputs)
+
+    # LR schedule: slower exponential decay
+    initial_learning_rate = 1e-4
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate, decay_steps=10000, decay_rate=0.96, staircase=True)
+
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+
+    return model
+
+
+model = build_efficientv2s_model((IMG_HEIGHT, IMG_WIDTH, 3))
+
+
+early_stopping = callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+model_checkpoint = callbacks.ModelCheckpoint("best_efficientv2s_cutmix.keras", monitor='val_accuracy', save_best_only=True)
+
+
+BATCH_SIZE = 16
+train_gen = cutmix_generator(X_train, y_train, datagen, batch_size=BATCH_SIZE, shuffle=True, cutmix_prob=0.5, alpha=1.0)
+
+steps_per_epoch = max(1, len(X_train) // BATCH_SIZE)
+
+history = model.fit(
+    train_gen,
+    steps_per_epoch=steps_per_epoch,
+    epochs=200,
+    validation_data=(X_test, y_test),
+    callbacks=[early_stopping, model_checkpoint],
+    verbose=1
+)
+
+
+model.load_weights("best_efficientv2s_cutmix.keras")
+test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test accuracy (EfficientNetV2-S + CutMix): {test_accuracy * 100:.2f}%")
+
+
+tf.keras.models.save_model(model, "/kaggle/working/final_EfficientNetV2S_CutMix.keras")
+print("Model saved successfully to /kaggle/working/final_EfficientNetV2S_CutMix.keras")

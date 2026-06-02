@@ -1,0 +1,173 @@
+import os
+import numpy as np
+from glob import glob
+import cv2
+import tensorflow as tf
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras import layers, models, callbacks, regularizers
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import EfficientNetV2M
+from tensorflow.keras.applications.efficientnet_v2 import preprocess_input
+from tensorflow.keras.layers import (
+    GlobalAveragePooling2D, GlobalMaxPooling2D, Dense, Reshape, Multiply,
+    Conv2D, Add, Activation, Lambda, Dropout
+)
+from sklearn.model_selection import train_test_split
+
+
+data_dir_anti_coronavirus = "/kaggle/input/ennavia-d-mol-mass-spectrogram-images/spectrogram images/anti-coronavirus images"
+data_dir_random_non_antiviral = "/kaggle/input/ennavia-d-mol-mass-spectrogram-images/spectrogram images/random-seq-non-antiviral images"
+
+IMG_HEIGHT, IMG_WIDTH = 224, 224
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+
+
+def load_images_from_directory(directory, label):
+    images, labels = [], []
+    files = glob(os.path.join(directory, "*.png"))
+    for file in files:
+        img = cv2.imread(file)
+        if img is None:
+            continue
+        img = cv2.resize(img, (IMG_WIDTH, IMG_HEIGHT))
+        img = preprocess_input(img)
+        images.append(img)
+        labels.append(label)
+    return np.array(images), np.array(labels)
+
+X_anti_corona, y_anti_corona = load_images_from_directory(data_dir_anti_coronavirus, 1)
+X_random_seq, y_random_seq = load_images_from_directory(data_dir_random_non_antiviral, 0)
+
+X = np.concatenate((X_anti_corona, X_random_seq), axis=0)
+y = np.concatenate((y_anti_corona, y_random_seq), axis=0)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=TEST_SIZE, random_state=RANDOM_STATE, stratify=y
+)
+
+
+indices = np.arange(X_train.shape[0])
+np.random.shuffle(indices)
+X_train, y_train = X_train[indices], y_train[indices]
+
+
+def cbam_block(input_tensor, ratio=8):
+    
+    channel_avg = GlobalAveragePooling2D()(input_tensor)
+    channel_max = GlobalMaxPooling2D()(input_tensor)
+
+    shared_dense_1 = Dense(input_tensor.shape[-1] // ratio, activation='relu')
+    shared_dense_2 = Dense(input_tensor.shape[-1], activation='sigmoid')
+
+    channel_avg = shared_dense_1(channel_avg)
+    channel_avg = shared_dense_2(channel_avg)
+
+    channel_max = shared_dense_1(channel_max)
+    channel_max = shared_dense_2(channel_max)
+
+    channel_att = Add()([channel_avg, channel_max])
+    channel_att = Activation('sigmoid')(channel_att)
+    channel_att = Reshape((1, 1, input_tensor.shape[-1]))(channel_att)
+    channel_refined = Multiply()([input_tensor, channel_att])
+
+   
+    avg_pool = Lambda(lambda x: tf.reduce_mean(x, axis=-1, keepdims=True))(channel_refined)
+    max_pool = Lambda(lambda x: tf.reduce_max(x, axis=-1, keepdims=True))(channel_refined)
+    concat = Add()([avg_pool, max_pool])
+    spatial_att = Conv2D(1, kernel_size=7, padding='same', activation='sigmoid')(concat)
+    spatial_refined = Multiply()([channel_refined, spatial_att])
+
+    return spatial_refined
+
+
+def cutmix(batch_x, batch_y, alpha=1.0):
+    lam = np.random.beta(alpha, alpha)
+    batch_size = batch_x.shape[0]
+    index = np.random.permutation(batch_size)
+    
+    h, w = batch_x.shape[1], batch_x.shape[2]
+    rx = np.random.randint(w)
+    ry = np.random.randint(h)
+    rw = int(w * np.sqrt(1 - lam))
+    rh = int(h * np.sqrt(1 - lam))
+    
+    x1 = np.clip(rx - rw // 2, 0, w)
+    y1 = np.clip(ry - rh // 2, 0, h)
+    x2 = np.clip(rx + rw // 2, 0, w)
+    y2 = np.clip(ry + rh // 2, 0, h)
+    
+    batch_x[:, y1:y2, x1:x2, :] = batch_x[index, y1:y2, x1:x2, :]
+    lam = 1 - ((x2 - x1) * (y2 - y1) / (w * h))
+    batch_y = batch_y * lam + batch_y[index] * (1 - lam)
+    return batch_x, batch_y
+
+class CutMixDataGenerator(tf.keras.utils.Sequence):
+    def __init__(self, X, y, batch_size=32, shuffle=True):
+        self.X = X
+        self.y = y
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.on_epoch_end()
+    
+    def __len__(self):
+        return int(np.ceil(len(self.X) / self.batch_size))
+    
+    def __getitem__(self, idx):
+        batch_x = self.X[idx * self.batch_size:(idx + 1) * self.batch_size].copy()
+        batch_y = self.y[idx * self.batch_size:(idx + 1) * self.batch_size].copy()
+        batch_x, batch_y = cutmix(batch_x, batch_y)
+        return batch_x, batch_y
+    
+    def on_epoch_end(self):
+        if self.shuffle:
+            idxs = np.arange(len(self.X))
+            np.random.shuffle(idxs)
+            self.X = self.X[idxs]
+            self.y = self.y[idxs]
+
+train_gen = CutMixDataGenerator(X_train, y_train, batch_size=32)
+
+
+def build_effnet_cbam_model(input_shape):
+    base_model = EfficientNetV2M(weights='imagenet', include_top=False, input_shape=input_shape)
+    
+   
+    for layer in base_model.layers[:-50]:
+        layer.trainable = False
+    
+    x = cbam_block(base_model.output)
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(512, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+    x = Dropout(0.4)(x)
+    outputs = Dense(1, activation='sigmoid')(x)
+    
+    model = models.Model(inputs=base_model.input, outputs=outputs)
+    
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    model.compile(optimizer=optimizer, loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+model = build_effnet_cbam_model((IMG_HEIGHT, IMG_WIDTH, 3))
+model.summary()  # optional: inspect model
+
+
+early_stopping = callbacks.EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+model_checkpoint = callbacks.ModelCheckpoint("best_effnetv2m_cbam_model.keras", monitor='val_accuracy', save_best_only=True)
+
+
+history = model.fit(
+    train_gen,
+    epochs=200,
+    validation_data=(X_test, y_test),
+    callbacks=[early_stopping, model_checkpoint],
+    verbose=1
+)
+
+
+model.load_weights("best_effnetv2m_cbam_model.keras")
+test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test accuracy with EfficientNetV2M + CBAM + CutMix: {test_accuracy * 100:.2f}%")
+
+model.save("/kaggle/working/final_effnetv2m_cbam_cutmix_model.keras")
+print("Model saved successfully!")
